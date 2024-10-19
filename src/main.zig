@@ -74,7 +74,7 @@ fn interpret(source: [:0]const u8) !u8 {
         const result = validateSource(source);
         if (result != .ok) {
             var bw = std.io.bufferedWriter(std.io.getStdErr().writer());
-            try bw.writer().print("{}\n", .{result});
+            try bw.writer().print("{}", .{result});
             try bw.flush();
             return 1;
         }
