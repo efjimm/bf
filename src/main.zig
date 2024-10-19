@@ -1,29 +1,89 @@
 const std = @import("std");
+const safety = std.debug.runtime_safety;
 
-pub fn validateSource(source: []const u8) !void {
+const Position = struct {
+    line: usize,
+    byte: usize,
+};
+
+const ValidationResult = union(enum) {
+    unmatched_opening: Position,
+    unmatched_closing: Position,
+    ok,
+
+    pub fn format(
+        res: ValidationResult,
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        switch (res) {
+            .ok => {},
+            inline .unmatched_opening, .unmatched_closing => |pos, tag| {
+                const type_str = switch (tag) {
+                    .unmatched_opening => "opening",
+                    .unmatched_closing => "closing",
+                    else => unreachable,
+                };
+
+                try writer.print("{d}:{d}: error: Unmatched {s} bracket\n", .{
+                    pos.line, pos.byte, type_str,
+                });
+            },
+        }
+    }
+};
+
+fn validateSource(source: []const u8) ValidationResult {
     var bracket_depth: usize = 0;
+    var pos: Position = .{ .line = 1, .byte = 0 };
+    var last_pos = pos;
+
     for (source) |c| switch (c) {
-        '[' => bracket_depth = std.math.add(usize, bracket_depth, 1) catch return error.UnmatchedBrackets,
-        ']' => bracket_depth = std.math.sub(usize, bracket_depth, 1) catch return error.UnmatchedBrackets,
-        else => {},
+        '[' => {
+            bracket_depth += 1;
+            last_pos = pos;
+        },
+        ']' => {
+            bracket_depth, const overflow = @subWithOverflow(bracket_depth, 1);
+            if (overflow == 1) return .{ .unmatched_closing = pos };
+        },
+        '\n' => {
+            pos.line += 1;
+            pos.byte = 0;
+        },
+        else => pos.byte += 1,
     };
 
     if (bracket_depth != 0)
-        return error.UnmatchedBrackets;
+        return .{ .unmatched_opening = last_pos };
+
+    return .ok;
 }
 
-pub fn interpretSlow(source: [:0]const u8) !void {
-    if (std.debug.runtime_safety) {
-        validateSource(source) catch unreachable;
+fn interpret(source: [:0]const u8) !u8 {
+    const stdin = std.io.getStdIn();
+    const stdout = std.io.getStdOut();
+    errdefer |err| {
+        var bw = std.io.bufferedWriter(std.io.getStdErr().writer());
+        bw.writer().print("error: {s}\n", .{@errorName(err)}) catch {};
+        bw.flush() catch {};
     }
 
-    const stdout = std.io.getStdOut();
-    const stdin = std.io.getStdIn();
+    {
+        const result = validateSource(source);
+        if (result != .ok) {
+            var bw = std.io.bufferedWriter(std.io.getStdErr().writer());
+            try bw.writer().print("{}\n", .{result});
+            try bw.flush();
+            return 1;
+        }
+    }
 
     var data = [_]u8{0} ** 65536;
     var d: usize = 0;
     var i: usize = 0;
-    while (i < source.len) : (i += 1) switch (source[i]) {
+    while (true) : (i += 1) switch (source[i]) {
         '>' => d += 1,
         '<' => d -= 1,
         '+' => data[d] +%= 1,
@@ -31,8 +91,9 @@ pub fn interpretSlow(source: [:0]const u8) !void {
         '.' => _ = try stdout.writeAll(data[d..][0..1]),
         ',' => {
             var in: [1]u8 = undefined;
-            const bytes_read = try stdin.readAll(&in);
-            if (bytes_read == 0) return error.Fug;
+
+            // Read until we have a byte
+            while (try stdin.readAll(&in) == 0) {}
 
             data[d] = in[0];
         },
@@ -67,11 +128,43 @@ pub fn interpretSlow(source: [:0]const u8) !void {
                 }
             }
         },
+        0 => break,
         else => {},
     };
+
+    return 0;
 }
 
-pub fn main() !void {
-    const source = @embedFile("test.bf");
-    try interpretSlow(source);
+pub fn main() u8 {
+    const usage =
+        \\usage: bf [file]
+        \\
+    ;
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer _ = if (safety) gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var args = try std.process.argsWithAllocator(gpa.allocator());
+    defer if (safety) args.deinit();
+
+    _ = args.next() orelse return 1;
+    const filepath = args.next() orelse {
+        std.io.getStdErr().writeAll(usage) catch {};
+        return 1;
+    };
+
+    const source = std.fs.cwd().readFileAllocOptions(
+        gpa.allocator(),
+        filepath,
+        std.math.pow(u64, 2, 32),
+        null,
+        1,
+        0,
+    ) catch {
+        std.io.getStdErr().writeAll("error: could not read file\n") catch {};
+        return 1;
+    };
+    defer if (safety) allocator.free(source);
+
+    return interpret(source) catch 1;
 }
